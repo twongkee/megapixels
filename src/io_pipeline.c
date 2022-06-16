@@ -47,7 +47,8 @@ struct camera_info {
         // int media_fd;
 
         // struct mp_media_link media_links[MP_MAX_LINKS];
-        // int num_media_links;
+        struct mp_media_link_config media_links[MP_MAX_LINKS];
+        int num_media_links;
 
         // int gain_ctrl;
 };
@@ -100,36 +101,68 @@ static bool want_focus = false;
 static MPPipeline *pipeline;
 static GSource *capture_source;
 
+// TODO: move to device.c
+static void
+mp_setup_media_link_pad_crops(struct device_info *dev_info,
+                              const struct mp_media_crop_config media_crops[],
+                              int num_media_crops)
+{
+        for(int i = 0; i < num_media_crops; i++) {
+                const struct mp_media_crop_config *crop = media_crops + i;
+                struct v4l2_subdev_crop v4l2_crop = {};
+                v4l2_crop.pad = crop->pad;
+                v4l2_crop.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+                v4l2_crop.rect.top = crop->top;
+                v4l2_crop.rect.left = crop->left;
+                v4l2_crop.rect.width = crop->width;
+                v4l2_crop.rect.height = crop->height;
+
+                if(!mp_xioctl(dev_info->device, crop->name, VIDIOC_SUBDEV_S_CROP, &v4l2_crop)) {
+                        //errno_printerr("VIDIOC_SUBDEV_S_CROP");
+                }
+        }
+}
+
 static void
 mp_setup_media_link_pad_formats(struct device_info *dev_info,
-                                const struct mp_media_link_config media_links[],
-                                int num_media_links,
-                                MPMode *mode)
+                                const struct mp_media_format_config media_formats[],
+                                int num_media_formats)
 {
-        const struct media_v2_entity *entities[2];
-        int ports[2];
-        for (int i = 0; i < num_media_links; i++) {
-                entities[0] = mp_device_find_entity(
-                        dev_info->device, (const char *)media_links[i].source_name);
-                entities[1] = mp_device_find_entity(
-                        dev_info->device, (const char *)media_links[i].target_name);
-                ports[0] = media_links[i].source_port;
-                ports[1] = media_links[i].target_port;
+        for(int i = 0; i < num_media_formats; i++) {
+                const struct mp_media_format_config *format =
+                        media_formats + i;
+                const struct media_v2_entity *entity =
+                        mp_device_find_entity
+                        (dev_info->device, format->name);
+                MPMode *mode =
+                        (MPMode *)
+                        &format->mode;
+                bool successful =
+                        mp_entity_pad_set_format
+                        (dev_info->device, entity, format->pad, mode);
 
-                for (int j = 0; j < 2; j++)
-                        if (!mp_entity_pad_set_format(
-                                    dev_info->device, entities[j], ports[j], mode)) {
-                                g_printerr("Failed to set %s:%d format\n",
-                                           entities[j]->name,
-                                           ports[j]);
-                                exit(EXIT_FAILURE);
-                        }
+                if(!successful) {
+                        g_printerr(     "Failed to set %s:%d format\n",
+                                        entity->name,
+                                        format->pad );
+                        exit(EXIT_FAILURE);
+                }
         }
 }
 
 static void
 setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
 {
+        char compat[512];
+        FILE *fp = fopen("/proc/device-tree/compatible", "r");
+        fgets(compat, 512, fp);
+        fclose(fp);
+
+        printf("setup_camera()\n");
+        printf("compatible: %s\n", compat);
+        printf("media_dev: %s\n", config->media_dev_name);
+        printf("dev: %s\n", config->dev_name);
+
         // Find device info
         size_t device_index = 0;
         for (; device_index < num_devices; ++device_index) {
@@ -144,6 +177,7 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
         if (device_index == num_devices) {
                 device_index = num_devices;
 
+                printf("initializing new device\n");
                 // Initialize new device
                 struct device_info *info = &devices[device_index];
                 info->media_dev_name = config->media_dev_name;
@@ -175,6 +209,8 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
                         exit(EXIT_FAILURE);
                 }
 
+                printf("video path: %s\n", dev_name);
+
                 info->video_fd = open(dev_name, O_RDWR);
                 if (info->video_fd == -1) {
                         g_printerr("Could not open %s: %s\n",
@@ -191,6 +227,9 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
                 struct device_info *dev_info = &devices[device_index];
 
                 info->device_index = device_index;
+                info->num_media_links = config->num_media_links;
+
+                memcpy(info->media_links, config->media_links, MP_MAX_LINKS * sizeof(struct mp_media_link_config));
 
                 const struct media_v2_entity *entity =
                         mp_device_find_entity(dev_info->device, config->dev_name);
@@ -205,11 +244,48 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
 
                 info->pad_id = pad->id;
 
+                // Disable all links
+                const size_t num_links =
+                        mp_device_get_num_links(dev_info->device);
+                const struct media_v2_link *links =
+                        mp_device_get_links(dev_info->device);
+
+                for(int i = 0; i < num_links; i++) {
+                        const struct media_v2_link *link = links + i;
+
+                        if(!(link->flags & MEDIA_LNK_FL_IMMUTABLE)) {
+                                mp_device_setup_link(dev_info->device,
+                                                     link->source_id,
+                                                     link->sink_id,
+                                                     false);
+                        }
+                }
+
                 // Make sure the camera starts out as disabled
-                mp_device_setup_link(dev_info->device,
-                                     info->pad_id,
-                                     dev_info->interface_pad_id,
-                                     false);
+                printf("making sure camera starts out disabled\n");
+                if(config->num_media_links > 0)
+                {
+                        const struct media_v2_entity *entity =
+                                mp_device_find_entity(dev_info->device, config->media_links[0].source_name);
+
+                        // This gets the first pad for this entity, which is
+                        // fine for Pinephone Pro, but does it really work for
+                        // all devices?
+                        const struct media_v2_pad* pad =
+                                mp_device_get_pad_from_entity(dev_info->device, entity->id);
+
+                        mp_device_setup_link(dev_info->device,
+                                             info->pad_id,
+                                             pad->id,
+                                             false);
+                }
+                else
+                {
+                        mp_device_setup_link(dev_info->device,
+                                             info->pad_id,
+                                             dev_info->interface_pad_id,
+                                             false);
+                }
 
                 const struct media_v2_interface *interface =
                         mp_device_find_entity_interface(dev_info->device,
@@ -220,6 +296,7 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
                         exit(EXIT_FAILURE);
                 }
 
+                printf("camera device path: %s\n", info->dev_fname);
                 info->fd = open(info->dev_fname, O_RDWR);
                 if (info->fd == -1) {
                         g_printerr("Could not open %s: %s\n",
@@ -234,11 +311,14 @@ setup_camera(MPDeviceList **device_list, const struct mp_camera_config *config)
                 // the ov5640 driver where it won't allow setting the preview
                 // format initially.
                 MPMode mode = config->capture_mode;
-                if (config->num_media_links)
+                if (config->num_media_formats)
                         mp_setup_media_link_pad_formats(dev_info,
-                                                        config->media_links,
-                                                        config->num_media_links,
-                                                        &mode);
+                                                        config->media_formats,
+                                                        config->num_media_formats);
+                if (config->num_media_crops)
+                        mp_setup_media_link_pad_crops(dev_info,
+                                                      config->media_crops,
+                                                      config->num_media_crops);
                 mp_camera_set_mode(info->camera, &mode);
 
                 // Trigger continuous auto focus if the sensor supports it
@@ -402,9 +482,12 @@ capture(MPPipeline *pipeline, const void *data)
         mode = camera->capture_mode;
         if (camera->num_media_links)
                 mp_setup_media_link_pad_formats(dev_info,
-                                                camera->media_links,
-                                                camera->num_media_links,
-                                                &mode);
+                                                camera->media_formats,
+                                                camera->num_media_formats);
+        if (camera->num_media_crops)
+                mp_setup_media_link_pad_crops(dev_info,
+                                              camera->media_crops,
+                                              camera->num_media_crops);
         mp_camera_set_mode(info->camera, &mode);
         just_switched_mode = true;
 
@@ -571,9 +654,13 @@ on_frame(MPBuffer buffer, void *_data)
                         if (camera->num_media_links)
                                 mp_setup_media_link_pad_formats(
                                         dev_info,
-                                        camera->media_links,
-                                        camera->num_media_links,
-                                        &mode);
+                                        camera->media_formats,
+                                        camera->num_media_formats);
+                        if (camera->num_media_crops)
+                                mp_setup_media_link_pad_crops(
+                                        dev_info,
+                                        camera->media_crops,
+                                        camera->num_media_crops);
                         mp_camera_set_mode(info->camera, &mode);
                         just_switched_mode = true;
 
@@ -611,6 +698,8 @@ mp_setup_media_link(struct device_info *dev_info,
 static void
 update_state(MPPipeline *pipeline, const struct mp_io_pipeline_state *state)
 {
+        printf("update_state()\n");
+
         // Make sure the state isn't updated more than it needs to be by checking
         // whether this state change actually changes anything.
         bool has_changed = false;
@@ -619,6 +708,7 @@ update_state(MPPipeline *pipeline, const struct mp_io_pipeline_state *state)
                 has_changed = true;
 
                 if (camera) {
+                        printf("uninitializing current camera\n");
                         struct camera_info *info = &cameras[camera->index];
                         struct device_info *dev_info = &devices[info->device_index];
 
@@ -636,6 +726,7 @@ update_state(MPPipeline *pipeline, const struct mp_io_pipeline_state *state)
                 }
 
                 if (capture_source) {
+                        printf("uninitializing current capture source\n");
                         g_source_destroy(capture_source);
                         capture_source = NULL;
                 }
@@ -643,13 +734,33 @@ update_state(MPPipeline *pipeline, const struct mp_io_pipeline_state *state)
                 camera = state->camera;
 
                 if (camera) {
+                        printf("initializing camera\n");
                         struct camera_info *info = &cameras[camera->index];
                         struct device_info *dev_info = &devices[info->device_index];
 
-                        mp_device_setup_link(dev_info->device,
-                                             info->pad_id,
-                                             dev_info->interface_pad_id,
-                                             true);
+                        if(info->num_media_links > 0)
+                        {
+                                const struct media_v2_entity *entity =
+                                        mp_device_find_entity(dev_info->device, info->media_links[0].source_name);
+
+                                // This gets the first pad for this entity, which is
+                                // fine for Pinephone Pro, but does it really work for
+                                // all devices?
+                                const struct media_v2_pad* pad =
+                                        mp_device_get_pad_from_entity(dev_info->device, entity->id);
+
+                                mp_device_setup_link(dev_info->device,
+                                                     info->pad_id,
+                                                     pad->id,
+                                                     true);
+                        }
+                        else
+                        {
+                                mp_device_setup_link(dev_info->device,
+                                                     info->pad_id,
+                                                     dev_info->interface_pad_id,
+                                                     true);
+                        }
 
                         // Enable media links
                         for (int i = 0; i < camera->num_media_links; i++)
@@ -660,9 +771,13 @@ update_state(MPPipeline *pipeline, const struct mp_io_pipeline_state *state)
                         if (camera->num_media_links)
                                 mp_setup_media_link_pad_formats(
                                         dev_info,
-                                        camera->media_links,
-                                        camera->num_media_links,
-                                        &mode);
+                                        camera->media_formats,
+                                        camera->num_media_formats);
+                        if (camera->num_media_crops)
+                                mp_setup_media_link_pad_crops(
+                                        dev_info,
+                                        camera->media_crops,
+                                        camera->num_media_crops);
                         mp_camera_set_mode(info->camera, &mode);
 
                         mp_camera_start_capture(info->camera);

@@ -59,6 +59,7 @@ install_data(
     'config/pine64,pinephone-1.0.ini',
     'config/pine64,pinephone-1.1.ini',
     'config/pine64,pinephone-1.2.ini',
+    'config/pine64,pinephone-pro.ini',
     'config/pine64,pinetab.ini',
     'config/xiaomi,scorpio.ini',
   ],

@@ -305,11 +305,11 @@ mp_camera_set_mode(MPCamera *camera, MPMode *mode)
                 }
 
                 // Update the mode
-                mode->pixel_format =
-                        mp_pixel_format_from_v4l_bus_code(fmt.format.code);
-                mode->frame_interval = interval.interval;
-                mode->width = fmt.format.width;
-                mode->height = fmt.format.height;
+                //mode->pixel_format =
+                //        mp_pixel_format_from_v4l_bus_code(fmt.format.code);
+                //mode->frame_interval = interval.interval;
+                //mode->width = fmt.format.width;
+                //mode->height = fmt.format.height;
         }
 
         // Set the mode for the video device
